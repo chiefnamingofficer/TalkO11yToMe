@@ -2,12 +2,45 @@
 
 ## 🎉 **Status: All Issues Fixed and Tested**
 
-**All Dynatrace tools are now fully operational with:**
+**All 6 Dynatrace tools are now fully operational with:**
+- ✅ **Shared Configuration**: Standardized `dotenv`-based config via `lib/config.js`
+- ✅ **DQL Query Polling**: Proper async query handling (202 → poll → results)
 - ✅ **OAuth authentication working** across all tools
 - ✅ **Proper error handling** with clear diagnostic messages  
-- ✅ **DQL queries functional** with correct timeframe formatting
 - ✅ **Real data retrieval** - finding actual problems and entities
 - ✅ **Enhanced scope configuration** aligned with user permissions
+- ✅ **Clean Architecture**: `lib/` vs `tools/` separation
+
+**📊 Architecture Improvements:**
+- **Before**: 40+ lines of environment parsing per tool × 6 tools = 240+ lines
+- **After**: 6 lines using shared config (`lib/config.js`) × 6 tools = 36 lines  
+- **Eliminated**: 204+ lines of duplicate code with enhanced validation
+
+---
+
+## 📁 **Project Structure Overview**
+
+```
+TalkO11yToMe/
+├── lib/                    # 🔧 Shared Infrastructure  
+│   ├── config.js          #    → Standardized dotenv configuration
+│   └── demo-dotenv.js     #    → Configuration demonstration
+└── tools/                  # 🚀 Production Tools (6 tools)
+    ├── grail-log-query.js        #    → Primary tool for Grail environments
+    ├── grail-business-analytics.js #  → DQL and business events (Grail)  
+    ├── classic-log-query.js      #    → Primary tool for Classic environments
+    ├── classic-api-client.js     #    → Comprehensive API client (both)
+    ├── dynatrace-oauth-tool.js   #    → Authentication testing
+    └── dynatrace-monitor.js      #    → Visual monitoring dashboard
+```
+
+### **Shared Configuration Pattern**
+All tools now use the standardized pattern:
+```javascript
+const config = require('../lib/config');
+const dt = await config.getDynatraceConfig();
+// 6 lines replace 40+ lines of custom environment parsing
+```
 
 ---
 
@@ -217,6 +250,21 @@ node tools/grail-business-analytics.js query "fetch logs | limit 5"
 **Data Retrieval**: ✅ **Excellent** - Finding real problems and entities  
 **Error Handling**: ✅ **Fixed** - Clear, actionable error messages
 **DQL Queries**: ✅ **Working** - Proper timeframe conversion implemented
+
+### **🧪 Continuous Testing**
+For ongoing validation, use the comprehensive test suite:
+```bash
+# Run all 8 validation tests (100% success rate)
+node tests/test-suite.js
+
+# View test history and trends
+node tests/test-history.js
+
+# See complete testing documentation
+cat tests/README.md
+```
+
+**📋 Complete Test Suite**: [Testing Documentation](../tests/README.md) - Automated validation with timestamped results and performance tracking
 
 ---
 

@@ -8,47 +8,23 @@
  */
 
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
 const { URL } = require('url');
+const { loadConfig, validateConfig } = require('../lib/config');
 
-// Load environment variables from env/.env.{environment}
+// Load environment variables using shared config
 function loadEnv(environment = 'dev') {
-    const envFile = `.env.${environment}`;
-    const envPath = path.join(__dirname, '..', 'env', envFile);
+    const config = loadConfig(environment);
+    const validation = validateConfig(config);
     
-    if (!fs.existsSync(envPath)) {
-        console.error(`❌ Environment file not found: ${envFile}`);
-        console.error(`   Expected path: ${envPath}`);
-        console.error(`   Available environments: dev, staging, prod`);
-        console.error(`   Create ${envFile} by copying env.template`);
-        process.exit(1);
+    if (!validation.valid) {
+        throw new Error(`Configuration validation failed: ${validation.errors.join(', ')}`);
     }
     
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    const lines = envContent.split('\n');
+    if (validation.warnings.length > 0) {
+        console.log(`⚠️  Warnings: ${validation.warnings.join(', ')}`);
+    }
     
-    const config = { environment };
-    lines.forEach(line => {
-        line = line.trim();
-        if (line && !line.startsWith('#')) {
-            if (line.startsWith('DT_ENVIRONMENT=')) {
-                config.dtEnvironment = line.split('=').slice(1).join('=');
-            }
-            if (line.startsWith('API_TOKEN=')) {
-                config.apiToken = line.split('=').slice(1).join('=');
-            }
-            if (line.startsWith('OAUTH_CLIENT_ID=')) {
-                config.oauthClientId = line.split('=').slice(1).join('=');
-            }
-            if (line.startsWith('OAUTH_CLIENT_SECRET=')) {
-                config.oauthClientSecret = line.split('=').slice(1).join('=');
-            }
-            if (line.startsWith('OAUTH_RESOURCE_URN=')) {
-                config.oauthResourceUrn = line.split('=').slice(1).join('=');
-            }
-        }
-    });
+    console.log(`🏗️  Environment type: ${validation.environmentType}`);
     
     return config;
 }
@@ -116,6 +92,39 @@ async function getOAuthToken(config) {
     });
 }
 
+// Determine appropriate authentication header
+function getAuthHeader(config, options = {}) {
+    const isGrailEnvironment = config.dtEnvironment.includes('.apps.dynatrace.com');
+    
+    // Override with explicit OAuth token if provided
+    if (options.useOAuth && options.oauthToken) {
+        return `Bearer ${options.oauthToken}`;
+    }
+    
+    // For Grail environments, OAuth is required
+    if (isGrailEnvironment) {
+        if (!options.oauthToken && !config.oauthClientId) {
+            console.log('⚠️  Grail environment requires OAuth - missing token');
+            return `Bearer MISSING_OAUTH_TOKEN`;
+        }
+        return `Bearer ${options.oauthToken || 'OAUTH_TOKEN_NEEDED'}`;
+    }
+    
+    // For Classic environments, prefer OAuth if available, fallback to API token
+    if (config.oauthClientId && config.oauthClientSecret && options.oauthToken) {
+        console.log('🔐 Using OAuth authentication for Classic environment');
+        return `Bearer ${options.oauthToken}`;
+    }
+    
+    if (config.apiToken) {
+        console.log('🔐 Using API Token authentication for Classic environment');
+        return `Api-Token ${config.apiToken}`;
+    }
+    
+    console.log('⚠️  No valid authentication method available');
+    return 'MISSING_AUTH';
+}
+
 // Enhanced API request function supporting both GET and POST
 function makeRequest(endpoint, config, options = {}) {
     return new Promise((resolve, reject) => {
@@ -147,10 +156,7 @@ function makeRequest(endpoint, config, options = {}) {
             path: parsedUrl.pathname + parsedUrl.search,
             method: options.method || 'GET',
             headers: {
-                'Authorization': options.useOAuth ? `Bearer ${options.oauthToken}` : 
-                    (isGrailEnvironment && !options.useOAuth ? 
-                        (() => { console.log('⚠️ API Token not supported on Grail - using OAuth fallback'); return `Bearer ${options.oauthToken || 'MISSING_OAUTH'}`; })() :
-                        `Api-Token ${config.apiToken}`),
+                'Authorization': getAuthHeader(config, options),
                 'Content-Type': 'application/json',
                 ...options.headers
             },
@@ -182,21 +188,27 @@ function makeRequest(endpoint, config, options = {}) {
                                 errorMessage += ': Unauthorized - Check your API token or OAuth credentials';
                                 break;
                             case 403:
-                                errorMessage += ': Forbidden - Insufficient permissions';
+                                errorMessage += ': Forbidden - Insufficient permissions or wrong scope';
                                 break;
                             case 404:
-                                errorMessage += ': Not Found - Endpoint or resource does not exist';
+                                errorMessage += ': Not Found - Check Dynatrace environment URL or endpoint';
                                 break;
                             case 429:
-                                errorMessage += ': Rate Limited - Too many requests';
+                                errorMessage += ': Rate Limited - Too many requests, please wait and retry';
                                 break;
                             case 500:
-                                errorMessage += ': Internal Server Error';
+                                errorMessage += ': Internal Server Error - Dynatrace service issue';
                                 break;
                             default:
                                 errorMessage += `: ${data.substring(0, 100)}`;
                         }
                     }
+                    
+                    // Add helpful context for debugging
+                    console.log(`🔍 Debug info for ${res.statusCode} error:`);
+                    console.log(`   URL: ${url}`);
+                    console.log(`   Method: ${options.method || 'GET'}`);
+                    console.log(`   Auth type: ${options.useOAuth ? 'OAuth' : 'API Token'}`);
                     
                     reject(new Error(errorMessage));
                     return;
@@ -219,6 +231,57 @@ function makeRequest(endpoint, config, options = {}) {
         }
         req.end();
     });
+}
+
+// Poll for DQL query results using request token
+async function pollQueryResults(config, requestToken, oauthToken, maxAttempts = 10) {
+    console.log(`🔄 Polling for query results with token: ${requestToken.substring(0, 10)}...`);
+    
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            // Wait before polling (except first attempt)
+            if (attempt > 1) {
+                await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+            }
+            
+            console.log(`🔄 Poll attempt ${attempt}/${maxAttempts}...`);
+            
+            const endpoint = `/platform/storage/query/v1/query:poll?request-token=${encodeURIComponent(requestToken)}`;
+            const result = await makeRequest(endpoint, config, { 
+                useOAuth: true,
+                oauthToken: oauthToken 
+            });
+            
+            console.log(`📡 Poll response state: ${result.state}`);
+            
+            if (result.state === 'SUCCEEDED') {
+                console.log(`✅ Query completed successfully!`);
+                if (result.result && result.result.records) {
+                    console.log(`📊 Found ${result.result.records.length} records`);
+                    return result.result;
+                } else {
+                    console.log(`⚠️  Query succeeded but returned no records`);
+                    return result.result || { records: [] };
+                }
+            } else if (result.state === 'FAILED') {
+                console.log(`❌ Query failed: ${result.error?.message || 'Unknown error'}`);
+                throw new Error(`Query failed: ${result.error?.message || 'Unknown error'}`);
+            } else if (result.state === 'RUNNING') {
+                console.log(`⏳ Query still running... (attempt ${attempt}/${maxAttempts})`);
+                continue;
+            } else {
+                console.log(`⚠️  Unexpected query state: ${result.state}`);
+            }
+            
+        } catch (error) {
+            console.log(`❌ Poll attempt ${attempt} failed: ${error.message}`);
+            if (attempt === maxAttempts) {
+                throw new Error(`Query polling failed after ${maxAttempts} attempts: ${error.message}`);
+            }
+        }
+    }
+    
+    throw new Error(`Query polling timed out after ${maxAttempts} attempts`);
 }
 
 // PROBLEMS queries
@@ -275,12 +338,40 @@ async function searchLogs(config, query, timeRange = 'now-1h', limit = 20) {
             return null;
         }
         
+        // Convert timeframe to proper ISO-8601 format
+        let startTime;
+        const now = new Date();
+        
+        if (timeRange.startsWith('now-')) {
+            const hoursMatch = timeRange.match(/now-(\d+)h/);
+            const daysMatch = timeRange.match(/now-(\d+)d/);
+            const minutesMatch = timeRange.match(/now-(\d+)m/);
+            
+            if (hoursMatch) {
+                const hours = parseInt(hoursMatch[1]);
+                startTime = new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString();
+            } else if (daysMatch) {
+                const days = parseInt(daysMatch[1]);
+                startTime = new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+            } else if (minutesMatch) {
+                const minutes = parseInt(minutesMatch[1]);
+                startTime = new Date(now.getTime() - minutes * 60 * 1000).toISOString();
+            } else {
+                // Default to 1 hour ago
+                startTime = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+            }
+        } else {
+            startTime = timeRange;
+        }
+        
+        const endTime = now.toISOString();
+        
         // Use the correct Platform Storage Query API endpoint
         const dqlQuery = `fetch logs | filter ${query} | limit ${limit}`;
         const requestBody = JSON.stringify({
             query: dqlQuery,
-            defaultTimeframeStart: timeRange,
-            defaultTimeframeEnd: 'now',
+            defaultTimeframeStart: startTime,
+            defaultTimeframeEnd: endTime,
             maxResultRecords: limit,
             fetchTimeoutSeconds: 60
         });
@@ -288,6 +379,7 @@ async function searchLogs(config, query, timeRange = 'now-1h', limit = 20) {
         console.log('📡 Making logs API request...');
         console.log(`   Endpoint: ${config.dtEnvironment}/platform/storage/query/v1/query:execute`);
         console.log(`   DQL Query: ${dqlQuery}`);
+        console.log(`   Timeframe: ${startTime} to ${endTime}`);
         
         const result = await makeRequest('/platform/storage/query/v1/query:execute', config, { 
             method: 'POST',
@@ -303,7 +395,18 @@ async function searchLogs(config, query, timeRange = 'now-1h', limit = 20) {
         console.log('   Response type:', typeof result);
         console.log('   Response keys:', result ? Object.keys(result) : 'null');
         
-        return result;
+        // Handle asynchronous query execution
+        if (result && result.state === 'RUNNING' && result.requestToken) {
+            console.log(`🔄 Query is running, polling for results...`);
+            return await pollQueryResults(config, result.requestToken, oauthToken);
+        } else if (result && result.records) {
+            console.log(`✅ Query returned ${result.records.length} records immediately`);
+            return result;
+        } else {
+            console.log(`⚠️  Query completed but returned no records`);
+            return result;
+        }
+        
     } catch (error) {
         console.error('❌ Error searching logs:', error.message);
         return null;
@@ -320,16 +423,44 @@ async function getLambdaErrorLogs(config, lambdaName, timeRange = 'now-24h') {
             return null;
         }
         
+        // Convert timeframe to proper ISO-8601 format
+        let startTime;
+        const now = new Date();
+        
+        if (timeRange.startsWith('now-')) {
+            const hoursMatch = timeRange.match(/now-(\d+)h/);
+            const daysMatch = timeRange.match(/now-(\d+)d/);
+            const minutesMatch = timeRange.match(/now-(\d+)m/);
+            
+            if (hoursMatch) {
+                const hours = parseInt(hoursMatch[1]);
+                startTime = new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString();
+            } else if (daysMatch) {
+                const days = parseInt(daysMatch[1]);
+                startTime = new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+            } else if (minutesMatch) {
+                const minutes = parseInt(minutesMatch[1]);
+                startTime = new Date(now.getTime() - minutes * 60 * 1000).toISOString();
+            } else {
+                // Default to 24 hours ago
+                startTime = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+            }
+        } else {
+            startTime = timeRange;
+        }
+        
+        const endTime = now.toISOString();
+
         // Use DQL syntax for Lambda function logs
         const dqlQuery = `fetch logs | filter content.level == "ERROR" and matchesPhrase(content, "${lambdaName}") | limit 100`;
         const requestBody = JSON.stringify({
             query: dqlQuery,
-            defaultTimeframeStart: timeRange,
-            defaultTimeframeEnd: 'now',
+            defaultTimeframeStart: startTime,
+            defaultTimeframeEnd: endTime,
             maxResultRecords: 100,
             fetchTimeoutSeconds: 60
         });
-        
+
         const result = await makeRequest('/platform/storage/query/v1/query:execute', config, { 
             method: 'POST',
             useOAuth: true, 
@@ -339,7 +470,19 @@ async function getLambdaErrorLogs(config, lambdaName, timeRange = 'now-24h') {
                 'Content-Type': 'application/json'
             }
         });
-        return result;
+        
+        // Handle asynchronous query execution
+        if (result && result.state === 'RUNNING' && result.requestToken) {
+            console.log(`🔄 Query is running, polling for results...`);
+            return await pollQueryResults(config, result.requestToken, oauthToken);
+        } else if (result && result.records) {
+            console.log(`✅ Query returned ${result.records.length} records immediately`);
+            return result;
+        } else {
+            console.log(`⚠️  Query completed but returned no records`);
+            return result;
+        }
+        
     } catch (error) {
         console.error('❌ Error fetching Lambda error logs:', error.message);
         return null;
@@ -488,7 +631,7 @@ async function main() {
     let commandArgs = args.slice(1);
     
     // Check if first argument is an environment
-    if (['dev', 'staging', 'prod'].includes(args[0])) {
+    if (['dev', 'staging', 'prod', 'test'].includes(args[0])) {
         environment = args[0];
         command = args[1];
         commandArgs = args.slice(2);
@@ -503,14 +646,30 @@ async function main() {
     console.log('====================================');
     
     const config = loadEnv(environment);
-    if (!config.dtEnvironment || !config.apiToken) {
-        console.error(`❌ Missing DT_ENVIRONMENT or API_TOKEN in env/.env.${environment}`);
+    const validation = validateConfig(config);
+    
+    // Flexible authentication validation
+    if (!config.dtEnvironment) {
+        console.error(`❌ Missing DT_ENVIRONMENT in env/.env.${environment}`);
+        process.exit(1);
+    }
+    
+    if (!config.apiToken && !config.oauthClientId) {
+        console.error(`❌ Missing authentication in env/.env.${environment}`);
+        console.error('   Provide either API_TOKEN or OAuth credentials (OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET)');
         process.exit(1);
     }
     
     console.log(`🌍 Environment: ${environment.toUpperCase()}`);
     console.log(`🔗 Dynatrace URL: ${config.dtEnvironment}`);
-    console.log(`🔑 Token: ${config.apiToken.substring(0, 15)}...`);
+    console.log(`🔑 Authentication: ${validation.authMethod.replace('_', ' ').toUpperCase()}`);
+    
+    if (config.apiToken) {
+        console.log(`🔑 API Token: ${config.apiToken.substring(0, 15)}...`);
+    }
+    if (config.oauthClientId) {
+        console.log(`🔑 OAuth Client: ${config.oauthClientId.substring(0, 15)}...`);
+    }
     console.log('');
 
     try {
@@ -518,7 +677,14 @@ async function main() {
             case 'problems':
                 const pageSize = parseInt(commandArgs[0]) || 5;
                 const result = await getProblems(config, pageSize);
-                if (result && result.problems) {
+                if (result === null) {
+                    console.log('❌ Failed to fetch problems - check connectivity, authentication, or Dynatrace URL');
+                    console.log('   This usually indicates:');
+                    console.log('   - Invalid Dynatrace environment URL');
+                    console.log('   - Network connectivity issues');
+                    console.log('   - Authentication problems (expired token, wrong credentials)');
+                    console.log('   - API endpoint not available');
+                } else if (result && result.problems) {
                     console.log(`📋 Found ${result.totalCount} total problems (showing ${result.problems.length}):`);
                     result.problems.forEach((problem, i) => {
                         console.log(`${i + 1}. ${problem.title} (${problem.status})`);
@@ -530,14 +696,16 @@ async function main() {
                         console.log('');
                     });
                 } else {
-                    console.log('No problems found or error occurred');
+                    console.log('✅ No problems found (successful API call returned zero results)');
                 }
                 break;
 
             case 'lambda-problems':
                 const timeRange = commandArgs[0] || 'now-24h';
                 const lambdaProblems = await getLambdaProblems(config, timeRange);
-                if (lambdaProblems && lambdaProblems.problems) {
+                if (lambdaProblems === null) {
+                    console.log('❌ Failed to fetch Lambda problems - check connectivity, authentication, or Dynatrace URL');
+                } else if (lambdaProblems && lambdaProblems.problems) {
                     console.log(`📋 Found ${lambdaProblems.problems.length} Lambda problems:`);
                     lambdaProblems.problems.forEach((problem, i) => {
                         console.log(`${i + 1}. ${problem.title} (${problem.status})`);
@@ -546,7 +714,7 @@ async function main() {
                         console.log('');
                     });
                 } else {
-                    console.log('No Lambda problems found');
+                    console.log('✅ No Lambda problems found (successful API call returned zero results)');
                 }
                 break;
 
@@ -559,7 +727,9 @@ async function main() {
                 const logTimeRange = commandArgs[1] || 'now-1h';
                 const limit = parseInt(commandArgs[2]) || 20;
                 const logs = await searchLogs(config, query, logTimeRange, limit);
-                if (logs && logs.results) {
+                if (logs === null) {
+                    console.log('❌ Failed to search logs - check connectivity, authentication, or Dynatrace URL');
+                } else if (logs && logs.results) {
                     console.log(`📄 Found ${logs.results.length} log entries:`);
                     logs.results.forEach((log, i) => {
                         console.log(`${i + 1}. [${new Date(log.timestamp).toLocaleString()}] ${log.status || 'INFO'}`);
@@ -567,7 +737,7 @@ async function main() {
                         console.log('');
                     });
                 } else {
-                    console.log('No logs found');
+                    console.log('✅ No logs found (successful API call returned zero results)');
                 }
                 break;
 
@@ -647,7 +817,9 @@ async function main() {
                 const entitySelector = commandArgs[0] || 'type(AWS_LAMBDA_FUNCTION)';
                 const fields = commandArgs[1] || 'displayName,entityId';
                 const entities = await getEntities(config, entitySelector, fields);
-                if (entities && entities.entities) {
+                if (entities === null) {
+                    console.log('❌ Failed to fetch entities - check connectivity, authentication, or Dynatrace URL');
+                } else if (entities && entities.entities) {
                     console.log(`🏢 Found ${entities.entities.length} entities:`);
                     entities.entities.forEach((entity, i) => {
                         console.log(`${i + 1}. ${entity.displayName}`);
@@ -658,7 +830,7 @@ async function main() {
                         console.log('');
                     });
                 } else {
-                    console.log('No entities found');
+                    console.log('✅ No entities found (successful API call returned zero results)');
                 }
                 break;
 

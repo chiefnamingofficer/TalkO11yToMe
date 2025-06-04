@@ -7,43 +7,23 @@
  */
 
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
 const { URL } = require('url');
+const { loadConfig, validateConfig } = require('../lib/config');
 
-// Handle certificate issues for testing
-process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0;
-
-// Load environment variables
+// Load environment variables using shared config
 function loadEnv(environment = 'dev') {
-    const envFile = `.env.${environment}`;
-    const envPath = path.join(__dirname, '..', 'env', envFile);
+    const config = loadConfig(environment);
+    const validation = validateConfig(config);
     
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    const config = { environment };
+    if (!validation.valid) {
+        throw new Error(`Configuration validation failed: ${validation.errors.join(', ')}`);
+    }
     
-    envContent.split('\n').forEach(line => {
-        line = line.trim();
-        if (line && !line.startsWith('#') && line.includes('=')) {
-            const [key, ...valueParts] = line.split('=');
-            const value = valueParts.join('=');
-            
-            switch (key) {
-                case 'DT_ENVIRONMENT':
-                    config.dtEnvironment = value;
-                    break;
-                case 'OAUTH_CLIENT_ID':
-                    config.oauthClientId = value;
-                    break;
-                case 'OAUTH_CLIENT_SECRET':
-                    config.oauthClientSecret = value;
-                    break;
-                case 'OAUTH_RESOURCE_URN':
-                    config.oauthResourceUrn = value;
-                    break;
-            }
-        }
-    });
+    if (validation.warnings.length > 0) {
+        console.log(`⚠️  Warnings: ${validation.warnings.join(', ')}`);
+    }
+    
+    console.log(`🏗️  Environment type: ${validation.environmentType}`);
     
     return config;
 }
@@ -265,7 +245,14 @@ async function executeDQLQuery(bearerToken, config, query, timeframe = { from: '
             contentType: 'application/json'
         });
         
-        if (result && result.records) {
+        console.log(`🔍 Debug - Complete API Response:`);
+        console.log(JSON.stringify(result, null, 2));
+        
+        // Handle asynchronous query execution
+        if (result && result.state === 'RUNNING' && result.requestToken) {
+            console.log(`🔄 Query is running, polling for results...`);
+            return await pollQueryResults(bearerToken, config, result.requestToken);
+        } else if (result && result.records) {
             console.log(`✅ Query returned ${result.records.length} records`);
             return result;
         } else {
@@ -277,6 +264,54 @@ async function executeDQLQuery(bearerToken, config, query, timeframe = { from: '
         console.log(`❌ DQL Query failed: ${error.message}`);
         throw error;
     }
+}
+
+// Poll for DQL query results using request token
+async function pollQueryResults(bearerToken, config, requestToken, maxAttempts = 10) {
+    console.log(`🔄 Polling for query results with token: ${requestToken.substring(0, 10)}...`);
+    
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            // Wait before polling (except first attempt)
+            if (attempt > 1) {
+                await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+            }
+            
+            console.log(`🔄 Poll attempt ${attempt}/${maxAttempts}...`);
+            
+            const endpoint = `/platform/storage/query/v1/query:poll?request-token=${encodeURIComponent(requestToken)}`;
+            const result = await makeGrailApiRequest(endpoint, bearerToken, config);
+            
+            console.log(`📡 Poll response state: ${result.state}`);
+            
+            if (result.state === 'SUCCEEDED') {
+                console.log(`✅ Query completed successfully!`);
+                if (result.result && result.result.records) {
+                    console.log(`📊 Found ${result.result.records.length} records`);
+                    return result.result;
+                } else {
+                    console.log(`⚠️  Query succeeded but returned no records`);
+                    return result.result || { records: [] };
+                }
+            } else if (result.state === 'FAILED') {
+                console.log(`❌ Query failed: ${result.error?.message || 'Unknown error'}`);
+                throw new Error(`Query failed: ${result.error?.message || 'Unknown error'}`);
+            } else if (result.state === 'RUNNING') {
+                console.log(`⏳ Query still running... (attempt ${attempt}/${maxAttempts})`);
+                continue;
+            } else {
+                console.log(`⚠️  Unexpected query state: ${result.state}`);
+            }
+            
+        } catch (error) {
+            console.log(`❌ Poll attempt ${attempt} failed: ${error.message}`);
+            if (attempt === maxAttempts) {
+                throw new Error(`Query polling failed after ${maxAttempts} attempts: ${error.message}`);
+            }
+        }
+    }
+    
+    throw new Error(`Query polling timed out after ${maxAttempts} attempts`);
 }
 
 // Ingest business events (based on documentation)

@@ -6,34 +6,31 @@
  */
 
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
+const { URL } = require('url');
+const { loadConfig, validateConfig } = require('../lib/config');
 
-// Load environment variables from env/.env.dev
+// Load environment variables using shared config
 function loadEnv() {
-    // Look for env/.env.dev relative to the project root (parent directory of tools)
-    const envPath = path.join(__dirname, '..', 'env', '.env.dev');
-    if (!fs.existsSync(envPath)) {
-        console.error('❌ env/.env.dev file not found');
-        console.error(`   Expected path: ${envPath}`);
-        process.exit(1);
+    const config = loadConfig('dev');
+    const validation = validateConfig(config);
+    
+    if (!validation.valid) {
+        throw new Error(`Configuration validation failed: ${validation.errors.join(', ')}`);
     }
     
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    const lines = envContent.split('\n');
+    if (validation.warnings.length > 0) {
+        console.log(`⚠️  Warnings: ${validation.warnings.join(', ')}`);
+    }
     
-    const config = {};
-    lines.forEach(line => {
-        line = line.trim();
-        if (line && !line.startsWith('#')) {
-            if (line.startsWith('DT_ENVIRONMENT=')) config.dtEnvironment = line.split('=').slice(1).join('=');
-            if (line.startsWith('OAUTH_CLIENT_ID=')) config.clientId = line.split('=').slice(1).join('=');
-            if (line.startsWith('OAUTH_CLIENT_SECRET=')) config.clientSecret = line.split('=').slice(1).join('=');
-            if (line.startsWith('OAUTH_RESOURCE_URN=')) config.resourceUrn = line.split('=').slice(1).join('=');
-        }
-    });
+    console.log(`🏗️  Environment type: ${validation.environmentType}`);
     
-    return config;
+    // Map to the property names this tool expects
+    return {
+        dtEnvironment: config.dtEnvironment,
+        clientId: config.oauthClientId,
+        clientSecret: config.oauthClientSecret,
+        resourceUrn: config.oauthResourceUrn
+    };
 }
 
 // Get OAuth bearer token

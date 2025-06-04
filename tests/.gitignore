@@ -1,0 +1,15 @@
+# Test Results - Timestamped files in results subfolder (keep only recent ones)
+results/TEST_RESULTS_20*.md
+
+# Keep these important files tracked in main tests directory:
+!TEST_RESULTS_LATEST.md
+!TEST_RESULTS_SUMMARY.md
+
+# Allow the results directory to be tracked (but not its timestamped contents)
+!results/
+results/*
+!results/.gitkeep
+
+# Allow keeping a few recent timestamped files for comparison
+# Uncomment the line below to track the last few timestamped results:
+# !results/TEST_RESULTS_2025-*.md 

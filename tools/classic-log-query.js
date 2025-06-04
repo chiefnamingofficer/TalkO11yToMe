@@ -7,43 +7,24 @@
  */
 
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
 const { URL, URLSearchParams } = require('url');
+const { loadConfig, validateConfig } = require('../lib/config');
 
-// Load environment variables
+// Load environment variables using shared config
 function loadEnv(environment = 'dev') {
-    const envFile = `.env.${environment}`;
-    const envPath = path.join(__dirname, '..', 'env', envFile);
+    const config = loadConfig(environment);
+    const validation = validateConfig(config);
     
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    const config = { environment };
+    if (!validation.valid) {
+        throw new Error(`Configuration validation failed: ${validation.errors.join(', ')}`);
+    }
     
-    envContent.split('\n').forEach(line => {
-        line = line.trim();
-        if (line && !line.startsWith('#') && line.includes('=')) {
-            const [key, ...valueParts] = line.split('=');
-            const value = valueParts.join('=');
-            
-            switch (key) {
-                case 'DT_ENVIRONMENT':
-                    config.dtEnvironment = value;
-                    break;
-                case 'API_TOKEN':
-                    config.apiToken = value;
-                    break;
-                case 'OAUTH_CLIENT_ID':
-                    config.oauthClientId = value;
-                    break;
-                case 'OAUTH_CLIENT_SECRET':
-                    config.oauthClientSecret = value;
-                    break;
-                case 'OAUTH_RESOURCE_URN':
-                    config.oauthResourceUrn = value;
-                    break;
-            }
-        }
-    });
+    if (validation.warnings.length > 0) {
+        console.log(`⚠️  Warnings: ${validation.warnings.join(', ')}`);
+    }
+    
+    console.log(`🏗️  Environment type: ${validation.environmentType}`);
+    console.log(`🔐 Authentication method: ${validation.authMethod}`);
     
     return config;
 }

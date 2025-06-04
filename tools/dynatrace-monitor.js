@@ -18,6 +18,8 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const { exec } = require('child_process');
+const { URL } = require('url');
+const { loadConfig, validateConfig } = require('../lib/config');
 
 // Colors for better console output
 const colors = {
@@ -31,33 +33,29 @@ const colors = {
     bold: '\x1b[1m'
 };
 
-// Load environment configuration
-function loadConfig() {
-    const envPath = path.join(__dirname, '..', 'env', '.env.dev');
-    if (!fs.existsSync(envPath)) {
-        console.error('❌ env/.env.dev file not found');
-        process.exit(1);
+// Load environment configuration using shared config
+function loadEnvironmentConfig(environment = 'dev') {
+    const config = loadConfig(environment);
+    const validation = validateConfig(config);
+    
+    if (!validation.valid) {
+        throw new Error(`Configuration validation failed: ${validation.errors.join(', ')}`);
     }
     
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    const config = {};
+    if (validation.warnings.length > 0) {
+        console.log(`⚠️  Warnings: ${validation.warnings.join(', ')}`);
+    }
     
-    envContent.split('\n').forEach(line => {
-        line = line.trim();
-        if (line && !line.startsWith('#')) {
-            const [key, ...valueParts] = line.split('=');
-            if (key && valueParts.length > 0) {
-                const value = valueParts.join('=');
-                if (key === 'DT_ENVIRONMENT') config.environment = value;
-                if (key === 'API_TOKEN') config.apiToken = value;
-                if (key === 'OAUTH_CLIENT_ID') config.oauthClientId = value;
-                if (key === 'OAUTH_CLIENT_SECRET') config.oauthClientSecret = value;
-                if (key === 'OAUTH_RESOURCE_URN') config.oauthResourceUrn = value;
-            }
-        }
-    });
+    console.log(`🏗️  Environment type: ${validation.environmentType}`);
+    console.log(`🔐 Authentication method: ${validation.authMethod}`);
     
-    return config;
+    return {
+        environment: config.dtEnvironment,
+        apiToken: config.apiToken,
+        oauthClientId: config.oauthClientId,
+        oauthClientSecret: config.oauthClientSecret,
+        oauthResourceUrn: config.oauthResourceUrn
+    };
 }
 
 // Execute tool and capture output
@@ -249,7 +247,7 @@ function displayDashboard(apiResults, oauthResults, analysis) {
 async function runMonitoring() {
     console.log(colors.bold + colors.blue + '🚀 Starting Dynatrace Monitoring...' + colors.reset);
     
-    const config = loadConfig();
+    const config = loadEnvironmentConfig();
     console.log(`🔗 Environment: ${config.environment}`);
     console.log(`🔑 API Token: ${config.apiToken ? 'Configured' : 'Missing'}`);
     console.log(`🔐 OAuth: ${config.oauthClientId ? 'Configured' : 'Missing'}`);
@@ -327,7 +325,7 @@ async function main() {
 
 // Export for use in other scripts
 module.exports = {
-    loadConfig,
+    loadEnvironmentConfig,
     runTool,
     makeApiRequest,
     analyzeProblems,
