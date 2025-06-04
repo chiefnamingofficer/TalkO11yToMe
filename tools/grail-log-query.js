@@ -47,10 +47,35 @@ function loadEnv(environment = 'dev') {
     return config;
 }
 
-// Get OAuth Bearer token
+// Get OAuth Bearer token with enhanced scopes
 async function getOAuthToken(config) {
     return new Promise((resolve, reject) => {
-        const postData = `grant_type=client_credentials&client_id=${config.oauthClientId}&client_secret=${config.oauthClientSecret}&scope=environment-api:problems:read environment-api:entities:read environment-api:events:read`;
+        const scopes = [
+            'storage:logs:read',
+            'storage:events:read',
+            'storage:metrics:read',
+            'storage:entities:read',
+            'storage:bizevents:read',
+            'storage:buckets:read',
+            'environment-api:problems:read',
+            'environment-api:entities:read',
+            'environment-api:events:read'
+        ].join(' ');
+        
+        // Build the request payload
+        const payload = {
+            grant_type: 'client_credentials',
+            client_id: config.oauthClientId,
+            client_secret: config.oauthClientSecret,
+            scope: scopes
+        };
+        
+        // Add resource if provided (required for some OAuth configurations)
+        if (config.oauthResourceUrn) {
+            payload.resource = config.oauthResourceUrn;
+        }
+        
+        const postData = new URLSearchParams(payload).toString();
         
         const options = {
             hostname: 'sso.dynatrace.com',
@@ -69,14 +94,15 @@ async function getOAuthToken(config) {
                 if (res.statusCode === 200) {
                     const tokenData = JSON.parse(data);
                     console.log(`🔐 OAuth token obtained (expires in ${tokenData.expires_in}s)`);
+                    console.log(`🎯 Scopes: ${tokenData.scope}`);
                     resolve(tokenData.access_token);
                 } else {
-                    reject(`OAuth failed: ${res.statusCode} - ${data}`);
+                    reject(new Error(`OAuth failed: ${res.statusCode} - ${data}`));
                 }
             });
         });
 
-        req.on('error', reject);
+        req.on('error', (err) => reject(new Error(`OAuth failed: ${err.message}`)));
         req.write(postData);
         req.end();
     });
@@ -274,9 +300,190 @@ async function queryEntitiesAPI(bearerToken, config, entityType = 'AWS_LAMBDA_FU
     return [];
 }
 
-// Main search function
+// Execute DQL Query via Grail API
+async function executeDQLQuery(bearerToken, config, query, timeframe = { from: 'now-1h', to: 'now' }) {
+    console.log(`\n🔍 Executing DQL Query: ${query}`);
+    
+    try {
+        // Convert timeframe to proper ISO-8601 format for API
+        let startTime, endTime;
+        
+        if (timeframe.from === 'now-1h' || timeframe.from.startsWith('now-')) {
+            // Handle relative timeframes by converting to absolute timestamps
+            const now = new Date();
+            const hoursMatch = timeframe.from.match(/now-(\d+)h/);
+            const daysMatch = timeframe.from.match(/now-(\d+)d/);
+            const minutesMatch = timeframe.from.match(/now-(\d+)m/);
+            
+            if (hoursMatch) {
+                const hours = parseInt(hoursMatch[1]);
+                startTime = new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString();
+            } else if (daysMatch) {
+                const days = parseInt(daysMatch[1]);
+                startTime = new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+            } else if (minutesMatch) {
+                const minutes = parseInt(minutesMatch[1]);
+                startTime = new Date(now.getTime() - minutes * 60 * 1000).toISOString();
+            } else {
+                // Default to 1 hour ago
+                startTime = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+            }
+            
+            // Handle 'to' time
+            if (timeframe.to === 'now' || !timeframe.to) {
+                endTime = now.toISOString();
+            } else {
+                endTime = timeframe.to;
+            }
+        } else {
+            // Use provided timeframe as-is if already in ISO format
+            startTime = timeframe.from;
+            endTime = timeframe.to || new Date().toISOString();
+        }
+        
+        console.log(`📅 Timeframe: ${startTime} to ${endTime}`);
+        
+        const requestBody = JSON.stringify({
+            query: query,
+            defaultTimeframeStart: startTime,
+            defaultTimeframeEnd: endTime,
+            maxResultRecords: 1000,
+            fetchTimeoutSeconds: 60
+        });
+        
+        const endpoint = '/platform/storage/query/v1/query:execute';
+        const result = await makeGrailApiRequest(endpoint, bearerToken, config, {
+            method: 'POST',
+            body: requestBody,
+            contentType: 'application/json'
+        });
+        
+        if (result && result.records) {
+            console.log(`✅ Query returned ${result.records.length} records`);
+            return result;
+        } else {
+            console.log(`⚠️  Query returned no records`);
+            return result;
+        }
+        
+    } catch (error) {
+        console.log(`❌ DQL Query failed: ${error.message}`);
+        throw error;
+    }
+}
+
+// Query Business Events API
+async function queryBusinessEvents(bearerToken, config, filter, timeRange = 'now-1h') {
+    console.log(`\n🔍 Searching Business Events with filter: "${filter}"`);
+    
+    try {
+        // Use DQL to query business events
+        const dqlQuery = `fetch bizevents 
+                         | filter matchesPhrase(toString(content), "${filter}")
+                         | sort timestamp desc
+                         | limit 50`;
+        
+        const result = await executeDQLQuery(bearerToken, config, dqlQuery, { 
+            from: timeRange, 
+            to: 'now' 
+        });
+        
+        if (result && result.records && result.records.length > 0) {
+            console.log(`\n📊 Business Events Summary:`);
+            console.log('============================');
+            
+            // Analyze event types
+            const eventTypes = {};
+            const paymentTypes = {};
+            let totalRevenue = 0;
+            
+            result.records.forEach(record => {
+                // Count event types
+                const eventType = record['event.type'] || 'unknown';
+                eventTypes[eventType] = (eventTypes[eventType] || 0) + 1;
+                
+                // Count payment types
+                if (record.paymentType) {
+                    paymentTypes[record.paymentType] = (paymentTypes[record.paymentType] || 0) + 1;
+                }
+                
+                // Sum revenue
+                if (record.total && typeof record.total === 'number') {
+                    totalRevenue += record.total;
+                }
+            });
+            
+            console.log(`📈 Total Events: ${result.records.length}`);
+            console.log(`💰 Total Revenue: $${totalRevenue.toFixed(2)}`);
+            
+            console.log(`\n🏷️  Event Types:`);
+            Object.entries(eventTypes).forEach(([type, count]) => {
+                console.log(`   ${type}: ${count}`);
+            });
+            
+            if (Object.keys(paymentTypes).length > 0) {
+                console.log(`\n💳 Payment Methods:`);
+                Object.entries(paymentTypes).forEach(([type, count]) => {
+                    console.log(`   ${type}: ${count}`);
+                });
+            }
+            
+            return result.records;
+        }
+        
+    } catch (error) {
+        console.log(`❌ Business Events query failed: ${error.message}`);
+    }
+    
+    return [];
+}
+
+// Advanced log correlation with business events
+async function correlateLogsWithBusiness(bearerToken, config, query, timeRange = 'now-1h') {
+    console.log(`\n🔍 Correlating logs and business events for: "${query}"`);
+    
+    try {
+        // Complex DQL query to correlate logs with business events
+        const dqlQuery = `fetch logs, bizevents
+                         | filter matchesPhrase(content, "${query}")
+                         | join (fetch bizevents), on: timestamp within 5m
+                         | summarize logCount = count(logs),
+                                   bizEventCount = count(bizevents),
+                                   businessImpact = sum(bizevents.total)
+                                   by bin(timestamp, 1m)
+                         | sort timestamp desc`;
+        
+        const result = await executeDQLQuery(bearerToken, config, dqlQuery, { 
+            from: timeRange, 
+            to: 'now' 
+        });
+        
+        if (result && result.records && result.records.length > 0) {
+            console.log(`\n📊 Correlation Analysis:`);
+            console.log('========================');
+            
+            result.records.forEach((record, i) => {
+                const timestamp = new Date(record.timestamp).toLocaleString();
+                console.log(`${i + 1}. [${timestamp}]`);
+                console.log(`   Log Events: ${record.logCount || 0}`);
+                console.log(`   Business Events: ${record.bizEventCount || 0}`);
+                console.log(`   Business Impact: $${(record.businessImpact || 0).toFixed(2)}`);
+                console.log('');
+            });
+            
+            return result.records;
+        }
+        
+    } catch (error) {
+        console.log(`❌ Correlation analysis failed: ${error.message}`);
+    }
+    
+    return [];
+}
+
+// Enhanced main search function
 async function searchLogs(config, query, timeRange = 'now-1h') {
-    console.log(`\n🚀 Grail-Compatible Dynatrace Search`);
+    console.log(`\n🚀 Enhanced Grail-Compatible Dynatrace Search`);
     console.log(`🔗 Environment: ${config.dtEnvironment}`);
     console.log(`🔍 Searching for: "${query}"`);
     console.log(`📅 Time Range: ${timeRange}`);
@@ -286,47 +493,66 @@ async function searchLogs(config, query, timeRange = 'now-1h') {
         // Get OAuth token
         const bearerToken = await getOAuthToken(config);
         
-        // Search across different APIs
+        // Enhanced search across different data sources
         const results = {
             problems: await queryProblemsAPI(bearerToken, config, query),
             events: await queryEventsAPI(bearerToken, config, query, timeRange),
             lambdas: await queryEntitiesAPI(bearerToken, config, 'AWS_LAMBDA_FUNCTION'),
-            services: await queryEntitiesAPI(bearerToken, config, 'SERVICE')
+            services: await queryEntitiesAPI(bearerToken, config, 'SERVICE'),
+            businessEvents: await queryBusinessEvents(bearerToken, config, query, timeRange),
+            correlation: await correlateLogsWithBusiness(bearerToken, config, query, timeRange)
         };
         
-        // Summary
-        console.log(`\n🎯 SEARCH SUMMARY for "${query}"`);
-        console.log('========================================');
+        // Enhanced Summary
+        console.log(`\n🎯 ENHANCED SEARCH SUMMARY for "${query}"`);
+        console.log('===========================================');
         console.log(`📊 Problems: ${results.problems.length}`);
         console.log(`📊 Events: ${results.events.length}`);
         console.log(`📊 Lambda Functions: ${results.lambdas.length}`);
         console.log(`📊 Services: ${results.services.length}`);
+        console.log(`📊 Business Events: ${results.businessEvents.length}`);
+        console.log(`📊 Correlations: ${results.correlation.length}`);
+        
+        // Business impact assessment
+        if (results.businessEvents.length > 0) {
+            const totalImpact = results.businessEvents.reduce((sum, event) => 
+                sum + (event.total || 0), 0);
+            console.log(`💰 Total Business Impact: $${totalImpact.toFixed(2)}`);
+        }
         
         return results;
         
     } catch (error) {
-        console.error('❌ Search failed:', error);
+        console.error('❌ Enhanced search failed:', error);
         return null;
     }
 }
 
-// CLI interface
+// CLI interface with enhanced commands
 async function main() {
     const args = process.argv.slice(2);
     
     if (args.length === 0 || args[0] === 'help') {
         console.log(`
-🔧 Grail-Compatible Dynatrace Log Query Tool
-===========================================
+🔧 Enhanced Grail-Compatible Dynatrace Log Query Tool
+====================================================
 
-This tool uses OAuth Bearer authentication for Grail environments.
+This tool uses OAuth Bearer authentication for Grail environments with advanced DQL support.
 
-Usage: node grail-log-query.js <query> [timeRange]
+Usage: node grail-log-query.js <command> [options]
+
+Commands:
+  search <query> [timeRange]    - Enhanced search across all data sources
+  dql <query> [timeRange]       - Execute custom DQL query
+  bizevents <filter> [timeRange] - Query business events specifically
+  correlate <query> [timeRange] - Correlate logs with business events
+  help                          - Show this help
 
 Examples:
-  node grail-log-query.js "error" now-2h
-  node grail-log-query.js "timeout" now-1h
-  node grail-log-query.js "lambda" now-30m
+  node grail-log-query.js search "error" now-2h
+  node grail-log-query.js dql "fetch logs | filter loglevel == 'ERROR' | limit 10"
+  node grail-log-query.js bizevents "payment" now-24h
+  node grail-log-query.js correlate "timeout" now-1h
         `);
         return;
     }
@@ -339,10 +565,58 @@ Examples:
         return;
     }
     
-    const query = args[0];
-    const timeRange = args[1] || 'now-1h';
-    
-    await searchLogs(config, query, timeRange);
+    try {
+        const bearerToken = await getOAuthToken(config);
+        const command = args[0];
+        
+        switch (command) {
+            case 'search':
+                if (!args[1]) {
+                    console.error('❌ Please provide a search query');
+                    return;
+                }
+                const query = args[1];
+                const timeRange = args[2] || 'now-1h';
+                await searchLogs(config, query, timeRange);
+                break;
+                
+            case 'dql':
+                if (!args[1]) {
+                    console.error('❌ Please provide a DQL query');
+                    return;
+                }
+                const dqlQuery = args[1];
+                const dqlTimeRange = args[2] || 'now-1h';
+                await executeDQLQuery(bearerToken, config, dqlQuery, { 
+                    from: dqlTimeRange, 
+                    to: 'now' 
+                });
+                break;
+                
+            case 'bizevents':
+                if (!args[1]) {
+                    console.error('❌ Please provide a filter for business events');
+                    return;
+                }
+                await queryBusinessEvents(bearerToken, config, args[1], args[2] || 'now-1h');
+                break;
+                
+            case 'correlate':
+                if (!args[1]) {
+                    console.error('❌ Please provide a query for correlation analysis');
+                    return;
+                }
+                await correlateLogsWithBusiness(bearerToken, config, args[1], args[2] || 'now-1h');
+                break;
+                
+            default:
+                console.error(`❌ Unknown command: ${command}`);
+                console.error('Use "help" to see available commands');
+        }
+        
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+    }
 }
 
 if (require.main === module) {

@@ -162,10 +162,52 @@ function makeRequest(endpoint, config, options = {}) {
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 console.log(`📡 Response: ${res.statusCode} (${data.length} bytes)`);
+                
+                // Check for HTTP error status codes
+                if (res.statusCode >= 400) {
+                    let errorMessage = `HTTP ${res.statusCode}`;
+                    
+                    // Parse error response for more details
+                    try {
+                        const errorData = JSON.parse(data);
+                        if (errorData.error && errorData.error.message) {
+                            errorMessage += `: ${errorData.error.message}`;
+                        } else if (errorData.message) {
+                            errorMessage += `: ${errorData.message}`;
+                        }
+                    } catch (e) {
+                        // If not JSON, use status code descriptions
+                        switch (res.statusCode) {
+                            case 401:
+                                errorMessage += ': Unauthorized - Check your API token or OAuth credentials';
+                                break;
+                            case 403:
+                                errorMessage += ': Forbidden - Insufficient permissions';
+                                break;
+                            case 404:
+                                errorMessage += ': Not Found - Endpoint or resource does not exist';
+                                break;
+                            case 429:
+                                errorMessage += ': Rate Limited - Too many requests';
+                                break;
+                            case 500:
+                                errorMessage += ': Internal Server Error';
+                                break;
+                            default:
+                                errorMessage += `: ${data.substring(0, 100)}`;
+                        }
+                    }
+                    
+                    reject(new Error(errorMessage));
+                    return;
+                }
+                
+                // Success response - parse and return
                 try {
                     const parsed = JSON.parse(data);
                     resolve(parsed);
                 } catch (e) {
+                    // If not JSON, return raw data
                     resolve(data);
                 }
             });
